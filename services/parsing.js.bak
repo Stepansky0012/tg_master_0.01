@@ -1,0 +1,270 @@
+import express from "express";
+import { TelegramClient } from "telegram";
+import { StringSession } from "telegram/sessions/index.js";
+import { Api } from "telegram";
+import { promises as fs } from "fs";
+import path from "path";
+
+/* ====== utils & guard ====== */
+function ok(res, data=null, meta=null){ res.status(200).json({ success:true, data, meta, error:null }); }
+function err(res, http=500, code="INTERNAL", message="Internal error", details=null){ res.status(http).json({ success:false, data:null, meta:null, error:{ code, message, details } }); }
+function isAuth(req){ const h=req.headers["authorization"]||""; const token=h.startsWith("Bearer ")?h.slice(7):h; return process.env.ADMIN_TOKEN ? token===process.env.ADMIN_TOKEN : true; }
+function guard(req,res,next){ if(!isAuth(req)) return err(res,401,"UNAUTHORIZED","Missing or invalid ADMIN_TOKEN"); next(); }
+
+const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+const jitter=(b)=>b+Math.floor(Math.random()*120);
+async function safeInvoke(client, q, {delayMs=Number(process.env.SAFE_BASE_DELAY_MS||950)}={}) {
+  const r = await client.invoke(q);
+  await sleep(jitter(delayMs));
+  return r;
+}
+
+/* ====== connect via named session ====== */
+async function makeClient({ session_name, api_id, api_hash }) {
+  const apiId = Number(api_id || process.env.TG_API_ID || "");
+  const apiHash = String(api_hash || process.env.TG_API_HASH || "");
+  if (!Number.isFinite(apiId) || !apiHash) throw new Error("api_id and api_hash are required (body or env)");
+
+  let str = "";
+  if (session_name){
+    for (const root of ["/app/data/sessions","/srv/tg-master-data/sessions"]) {
+      try {
+        const raw = JSON.parse(await fs.readFile(path.join(root, `${session_name}.json`), "utf8"));
+        if (raw?.session_string) { str = raw.session_string; break; }
+      } catch {}
+    }
+  }
+  if (!str) throw new Error("session_string not found for given session_name");
+
+  const client = new TelegramClient(new StringSession(str), apiId, apiHash, { connectionRetries: 3 });
+  await client.connect();
+  return client;
+}
+
+/* ====== typing helpers ====== */
+function toType(chat){
+  if (!chat) return null;
+  if (chat.className === "Channel") return chat.megagroup ? "supergroup" : "channel";
+  if (chat.className === "Chat") return "group";
+  return "unknown";
+}
+async function toFull(client, chat){
+  try{
+    if (chat.className === "Channel"){
+      const input = new Api.InputChannel({ channelId: chat.id, accessHash: chat.accessHash });
+      return await safeInvoke(client, new Api.channels.GetFullChannel({ channel: input }));
+    }
+    if (chat.className === "Chat"){
+      return await safeInvoke(client, new Api.messages.GetFullChat({ chatId: chat.id }));
+    }
+  } catch {}
+  return null;
+}
+function normalize(chat, full){
+  const base = {
+    id: chat?.id ?? null,
+    access_hash: chat?.accessHash ?? null,
+    type: toType(chat),
+    title: chat?.title ?? null,
+    username: chat?.username ? `@${chat.username}` : null,
+    is_verified: chat?.verified ?? null,
+    is_scam: chat?.scam ?? null,
+    is_fake: chat?.fake ?? null,
+  };
+  if (full){
+    const fc = full.fullChat || {};
+    const linked = (full.chats || []).find(c => c.id === fc.linkedChatId);
+    base.about = fc.about ?? null;
+    base.members_count = fc.participantsCount ?? fc.subscribersCount ?? null;
+    base.online_count = fc.onlineCount ?? null;
+    base.linked_chat_username = linked?.username ? `@${linked.username}` : null;
+    base.linked_chat_id = fc.linkedChatId ?? null;
+  }
+  return base;
+}
+
+/* ====== resolve entity by username/title/invite ====== */
+async function resolveEntity(client, { username, title, invite }){
+  if (username){
+    const handle = String(username).replace(/^@/,"");
+    try { return await client.getEntity(handle); } catch {}
+  }
+  if (invite){
+    const hash = (String(invite).match(/(?:joinchat\/|\+)([A-Za-z0-9_-]+)/) || [])[1];
+    if (!hash) throw new Error("Invalid invite link");
+    const info = await safeInvoke(client, new Api.messages.CheckChatInvite({ hash }));
+    if (info.className === "ChatInviteAlready") return info.chat;
+    throw new Error("Join via invite required");
+  }
+  if (title){
+    const res = await safeInvoke(client, new Api.contacts.Search({ q: String(title), limit: 50 }));
+    const chats = [...(res.chats ?? [])];
+    let match = chats.find(c => (c.title || "").toLowerCase() === String(title).toLowerCase());
+    if (!match) match = chats.find(c => (c.title || "").toLowerCase().includes(String(title).toLowerCase()));
+    return match || null;
+  }
+  throw new Error("Provide one of: username | title | invite");
+}
+
+/* ====== members listing for supergroups (open) ====== */
+async function listMembers(client, entity, { limit="ALL", page_size=200, offset=0, pause_ms=500 }){
+  if (!(entity.className === "Channel" && entity.megagroup)) return { items: [], next_offset: 0 };
+
+  const step = Math.min(Number(page_size)||200, 200);
+  const wantAll = String(limit).toUpperCase() === "ALL";
+  const maxTotal = wantAll ? Number.MAX_SAFE_INTEGER : Math.max(Number(limit)||0, 0);
+
+  let items = [];
+  let off = Number(offset)||0;
+
+  while (items.length < maxTotal){
+    const resp = await safeInvoke(client, new Api.channels.GetParticipants({
+      channel: new Api.InputChannel({ channelId: entity.id, accessHash: entity.accessHash }),
+      filter: new Api.ChannelParticipantsRecent(),
+      offset: off,
+      limit: step,
+      hash: 0
+    }));
+    const usersMap = new Map();
+    for (const u of resp.users || []) usersMap.set(String(u.id), u);
+    const batch = (resp.participants || []).map(p => {
+      const u = usersMap.get(String(p.userId));
+      return {
+        user_id: String(p.userId),
+        username: u?.username ? `@${u.username}` : null,
+        first_name: u?.firstName ?? null,
+        last_name: u?.lastName ?? null,
+        bot: u?.bot ?? false
+      };
+    });
+    if (batch.length === 0) break;
+    if (wantAll) items.push(...batch);
+    else {
+      const room = maxTotal - items.length;
+      items.push(...batch.slice(0, room));
+    }
+    off += batch.length;
+    if (batch.length < step) break;
+    await sleep(Math.max(Number(pause_ms)||0, 0));
+  }
+  return { items, next_offset: off };
+}
+
+/* ====== messages for last N days (closed participants) ====== */
+async function pickDiscussionTarget(client, entity){
+  // If channel has linked discussion group — use it
+  if (entity.className === "Channel" && !entity.megagroup){
+    const full = await toFull(client, entity);
+    const linkedId = full?.fullChat?.linkedChatId;
+    if (linkedId){
+      try {
+        const chats = await safeInvoke(client, new Api.messages.GetChats({ id: [linkedId] }));
+        const chat = (chats.chats || []).find(c => c.id === linkedId);
+        if (chat) return chat;
+      } catch {}
+      // if not accessible — still allow messages from channel itself
+    }
+    return entity;
+  }
+  return entity; // groups/supergroups: read directly
+}
+
+async function listMessages(client, entity, { days=30, limit=500, page_size=100, pause_ms=500 }){
+  const target = await pickDiscussionTarget(client, entity);
+  const until = Date.now() - Math.max(Number(days)||30, 1)*24*3600*1000;
+
+  const items = [];
+  let offsetId = 0;
+  const step = Math.min(Number(page_size)||100, 100);
+
+  while (items.length < Number(limit)||500){
+    const resp = await safeInvoke(client, new Api.messages.GetHistory({
+      peer: target,
+      offsetId,
+      limit: step
+    }));
+    const msgs = resp.messages || [];
+    const usersMap = new Map();
+    for (const u of resp.users || []) usersMap.set(String(u.id), u);
+
+    if (msgs.length === 0) break;
+
+    for (const m of msgs){
+      const ts = (m?.date ? (Number(m.date) * 1000) : Date.now());
+      if (ts < until) return items; // older than window: stop
+
+      const authorId = m?.fromId?.userId ?? m?.peerId?.userId ?? null;
+      const u = authorId ? usersMap.get(String(authorId)) : null;
+
+      items.push({
+        id: m?.id ?? null,
+        date_ts: ts,
+        text: typeof m?.message === "string" ? m.message : "",
+        author_id: authorId ? String(authorId) : null,
+        author_username: u?.username ? `@${u.username}` : null,
+        has_media: Boolean(m?.media),
+        replies: m?.replies?.replies ?? null
+      });
+      if (items.length >= Number(limit)||500) break;
+      offsetId = m?.id || offsetId;
+    }
+    if (msgs.length < step) break;
+    await sleep(Math.max(Number(pause_ms)||0, 0));
+  }
+  return items;
+}
+
+/* ====== Router ====== */
+export default function registerParsing(app){
+  const router = express.Router();
+
+  // POST /v1/parsing/resolve
+  router.post("/resolve", guard, async (req,res)=>{
+    try{
+      const { session_name, api_id, api_hash, username, title, invite } = req.body || {};
+      if (!session_name) return err(res,400,"BAD_REQUEST","session_name required");
+      const client = await makeClient({ session_name, api_id, api_hash });
+      const entity = await resolveEntity(client, { username, title, invite });
+      if (!entity) return err(res,404,"NOT_FOUND","chat not found");
+      const full = await toFull(client, entity);
+      const item = normalize(entity, full);
+      try { await client.disconnect(); } catch {}
+      return ok(res, { item });
+    } catch(e){ return err(res, /FLOOD_WAIT/.test(String(e?.message||e))?429:500, /FLOOD_WAIT/.test(String(e?.message||e))?"FLOOD_WAIT":"INTERNAL", String(e?.message||e)); }
+  });
+
+  // POST /v1/parsing/members
+  router.post("/members", guard, async (req,res)=>{
+    try{
+      const { session_name, api_id, api_hash, username, title, invite, limit="ALL", page_size=200, offset=0, pause_ms=500 } = req.body || {};
+      if (!session_name) return err(res,400,"BAD_REQUEST","session_name required");
+      const client = await makeClient({ session_name, api_id, api_hash });
+      const entity = await resolveEntity(client, { username, title, invite });
+      if (!entity) return err(res,404,"NOT_FOUND","chat not found");
+      const type = toType(entity);
+      if (type !== "supergroup"){ // участники доступны только у супергрупп
+        try { await client.disconnect(); } catch {}
+        return ok(res, { items: [] }, { returned: 0 });
+      }
+      const { items, next_offset } = await listMembers(client, entity, { limit, page_size, offset, pause_ms });
+      try { await client.disconnect(); } catch {}
+      return ok(res, { items }, { returned: items.length, next_offset });
+    } catch(e){ return err(res, /FLOOD_WAIT/.test(String(e?.message||e))?429:500, /FLOOD_WAIT/.test(String(e?.message||e))?"FLOOD_WAIT":"INTERNAL", String(e?.message||e)); }
+  });
+
+  // POST /v1/parsing/messages
+  router.post("/messages", guard, async (req,res)=>{
+    try{
+      const { session_name, api_id, api_hash, username, title, invite, days=30, limit=500, page_size=100, pause_ms=500 } = req.body || {};
+      if (!session_name) return err(res,400,"BAD_REQUEST","session_name required");
+      const client = await makeClient({ session_name, api_id, api_hash });
+      const entity = await resolveEntity(client, { username, title, invite });
+      if (!entity) return err(res,404,"NOT_FOUND","chat not found");
+      const msgs = await listMessages(client, entity, { days, limit, page_size, pause_ms });
+      try { await client.disconnect(); } catch {}
+      return ok(res, { items: msgs }, { returned: msgs.length, days: Number(days)||30 });
+    } catch(e){ return err(res, /FLOOD_WAIT/.test(String(e?.message||e))?429:500, /FLOOD_WAIT/.test(String(e?.message||e))?"FLOOD_WAIT":"INTERNAL", String(e?.message||e)); }
+  });
+
+  app.use("/v1/parsing", router);
+}
